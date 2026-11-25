@@ -1,30 +1,68 @@
-import csv, io, json, math
-from datetime import date, timedelta
+import csv, io, json, math, time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import urlopen, Request
 
+PATH = Path('market_macro.json')
+TODAY = datetime.now(timezone.utc).date()
+START = TODAY - timedelta(days=90)
 
-def collect(series):
-    start = date.today() - timedelta(days=90)
-    url = f'https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&cosd={start}'
-    with urlopen(Request(url, headers={'User-Agent': 'MarketDashboard/1.0'}), timeout=45) as response:
-        reader = csv.DictReader(io.StringIO(response.read().decode('utf-8-sig')))
-        rows = {}
-        for row in reader:
-            try:
-                d = row.get('observation_date') or row.get('DATE')
-                v = float(row[series])
-                if date.fromisoformat(d) <= date.today() and math.isfinite(v) and v > 0:
-                    rows[d] = v
-            except (ValueError, TypeError, KeyError):
-                continue
-    if len(rows) < 6 or (date.today()-date.fromisoformat(max(rows))).days >= 7:
-        raise RuntimeError(f'{series}: insufficient or stale data')
+
+def fetch(url, column, cboe=False):
+    print('Fetching:', url, flush=True)
+    with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'text/csv,*/*'}), timeout=35) as response:
+        content = response.read().decode('utf-8-sig')
+    rows = {}
+    for row in csv.DictReader(io.StringIO(content)):
+        try:
+            raw = row.get('observation_date') or row.get('DATE')
+            d = datetime.strptime(raw.strip(), '%m/%d/%Y').date() if cboe else date.fromisoformat(raw.strip())
+            v = float(row[column])
+            if START <= d <= TODAY and math.isfinite(v) and v > 0:
+                rows[d.isoformat()] = v
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+    if len(rows) < 6 or (TODAY-date.fromisoformat(max(rows))).days >= 7:
+        raise RuntimeError('Insufficient or stale observations')
     history = [{'d': d, 'v': rows[d]} for d in sorted(rows)[-30:]]
     return {'date': history[-1]['d'], 'value': history[-1]['v'], 'history': history}
 
 
+def fred(series):
+    return fetch(f'https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&cosd={START}', series)
+
+
+def collect(key):
+    sources = ([('Cboe', lambda: fetch('https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv', 'CLOSE', True)), ('FRED', lambda: fred('VIXCLS'))] if key == 'vix' else [('FRED', lambda: fred('BAMLH0A0HYM2'))])
+    for attempt in range(2):
+        for name, fn in sources:
+            try:
+                result = fn()
+                print(f'{key}: {name} OK ({result["date"]})', flush=True)
+                return result
+            except Exception as exc:
+                print(f'{key}: {name} attempt {attempt+1}: {type(exc).__name__}: {exc}', flush=True)
+        if attempt == 0:
+            time.sleep(3)
+    print(f'::warning::{key} collection failed; retaining existing data if available', flush=True)
+    return None
+
+
+def main():
+    old = json.loads(PATH.read_text(encoding='utf-8')) if PATH.exists() else {}
+    result = dict(old)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        updates = dict(zip(('vix', 'hy'), pool.map(collect, ('vix', 'hy'))))
+    for key, value in updates.items():
+        if value is not None and value['date'] >= old.get(key, {}).get('date', ''):
+            result[key] = value
+    if not any(updates.values()):
+        raise SystemExit('Both sources failed; existing JSON left unchanged.')
+    tmp = PATH.with_suffix('.tmp')
+    tmp.write_text(json.dumps(result, indent=2, allow_nan=False)+'\n', encoding='utf-8')
+    tmp.replace(PATH)
+    print('Saved:', ', '.join(result), flush=True)
+
 if __name__ == '__main__':
-    result = {'vix': collect('VIXCLS'), 'hy': collect('BAMLH0A0HYM2')}
-    Path('market_macro.json').write_text(json.dumps(result, indent=2, allow_nan=False)+'\n', encoding='utf-8')
-    print('Updated:', result['vix']['date'], result['hy']['date'])
+    main()
