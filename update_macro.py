@@ -1,4 +1,6 @@
-import csv, io, json, math, time
+import csv, io, json, math, time, os
+from urllib.parse import urlencode
+from urllib.error import HTTPError
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +32,33 @@ def fetch(url, column, cboe=False):
 
 
 def fred(series):
-    return fetch(f'https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&cosd={START}', series)
+    key = os.environ.get('FRED_API_KEY', '').strip()
+    if not key:
+        raise RuntimeError('FRED_API_KEY secret missing')
+    params = urlencode({'series_id': series, 'api_key': key,
+                        'file_type': 'json', 'observation_start': START.isoformat()})
+    print(f'Fetching FRED API: {series}', flush=True)
+    try:
+        with urlopen(Request('https://api.stlouisfed.org/fred/series/observations?' + params,
+                             headers={'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0'}), timeout=35) as response:
+            payload = json.load(response)
+    except HTTPError as exc:
+        raise RuntimeError(f'FRED HTTP {exc.code}') from None
+    except Exception as exc:
+        raise RuntimeError(f'FRED connection/read failure: {type(exc).__name__}') from None
+    rows = {}
+    for row in payload.get('observations', []):
+        try:
+            d = date.fromisoformat(row['date'])
+            v = float(row['value'])
+            if START <= d <= TODAY and math.isfinite(v) and v > 0:
+                rows[d.isoformat()] = v
+        except (ValueError, TypeError, KeyError):
+            continue
+    if len(rows) < 6 or (TODAY-date.fromisoformat(max(rows))).days >= 7:
+        raise RuntimeError('Insufficient or stale FRED observations')
+    history = [{'d': d, 'v': rows[d]} for d in sorted(rows)[-30:]]
+    return {'date': history[-1]['d'], 'value': history[-1]['v'], 'history': history}
 
 
 def collect(key):
